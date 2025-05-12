@@ -9,7 +9,7 @@ pkill -f "npm run dev" || true
 set -e
 
 # Setup environment variables
-export OPENAI_API_KEY="YOUR_API_KEY_HERE"
+export OPENAI_API_KEY=""  # Leave empty by default, should be set from .env file
 
 # Define the project directories
 BACKEND_DIR="$(pwd)/backend"
