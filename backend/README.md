@@ -83,9 +83,5 @@ API будет доступно по адресу `http://localhost:8000/api/`.
 - Пользователи: `/api/users/`
   - Профиль: `/api/users/profile/`
 
-## Запуск тестов
 
-Запустить тесты:
-```bash
-python manage.py test
 ``` 
