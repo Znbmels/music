@@ -1,12 +1,15 @@
 import { useState, useEffect } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import axios from '../../utils/axios';
+import { useAudioPlayer } from '../../contexts/AudioPlayerContext';
+import { PlayIcon, PauseIcon, TrashIcon } from '@heroicons/react/24/solid';
 
-interface Track {
+interface ApiPlaylistTrack {
   id: number;
   title: string;
   genre: string;
-  audio_url: string;
+  audio_file: string;
+  cover_image?: string | null;
   musician: {
     id: number;
     username: string;
@@ -19,17 +22,33 @@ interface Playlist {
   id: number;
   name: string;
   description?: string;
-  tracks: Track[];
+  tracks: ApiPlaylistTrack[];
+}
+
+interface PlayerTrack {
+  id: number;
+  title: string;
+  musician_name?: string;
+  audio_file: string;
+  cover_image?: string | null;
+  genre?: string;
 }
 
 export default function PlaylistDetail() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
   const [playlist, setPlaylist] = useState<Playlist | null>(null);
-  const [availableTracks, setAvailableTracks] = useState<Track[]>([]);
+  const [availableTracks, setAvailableTracks] = useState<ApiPlaylistTrack[]>([]);
   const [selectedTrackId, setSelectedTrackId] = useState('');
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState('');
+
+  const {
+    loadQueueAndPlay,
+    currentTrack,
+    isPlaying,
+    togglePlayPause,
+  } = useAudioPlayer();
 
   useEffect(() => {
     fetchData();
@@ -38,12 +57,10 @@ export default function PlaylistDetail() {
   const fetchData = async () => {
     setIsLoading(true);
     try {
-      // Загружаем плейлист
-      const playlistResponse = await axios.get(`/playlists/${id}/`);
+      const playlistResponse = await axios.get<Playlist>(`/playlists/${id}/`);
       setPlaylist(playlistResponse.data);
       
-      // Загружаем доступные треки
-      const tracksResponse = await axios.get('/tracks/');
+      const tracksResponse = await axios.get<ApiPlaylistTrack[]>('/tracks/');
       setAvailableTracks(tracksResponse.data);
       
       setError('');
@@ -85,16 +102,30 @@ export default function PlaylistDetail() {
     }
   };
 
-  const handlePlayTrack = async (track: Track) => {
+  const handlePlayPauseTrack = (clickedTrack: ApiPlaylistTrack, trackIndex: number) => {
+    if (!playlist) return;
+
+    if (currentTrack?.id === clickedTrack.id) {
+      togglePlayPause();
+    } else {
+      const playerQueue: PlayerTrack[] = playlist.tracks.map(apiTrack => ({
+        id: apiTrack.id,
+        title: apiTrack.title,
+        musician_name: apiTrack.musician.username,
+        audio_file: apiTrack.audio_file,
+        cover_image: apiTrack.cover_image,
+        genre: apiTrack.genre,
+      }));
+      loadQueueAndPlay(playerQueue, trackIndex);
+    }
+    logPlayInteraction(clickedTrack.id);
+  };
+
+  const logPlayInteraction = async (trackId: number) => {
     try {
-      // Регистрируем прослушивание трека
-      await axios.post(`/tracks/${track.id}/play/`);
-      
-      // Здесь можно добавить код для воспроизведения аудио
-      const audio = new Audio(track.audio_url);
-      audio.play();
+      await axios.post(`/tracks/${trackId}/play/`);
     } catch (err) {
-      console.error('Ошибка при воспроизведении трека:', err);
+      console.error('Error logging play interaction for track:', trackId, err);
     }
   };
 
@@ -112,7 +143,7 @@ export default function PlaylistDetail() {
         <div className="text-red-500 mb-4">{error}</div>
         <button 
           onClick={() => navigate('/playlists')}
-          className="px-4 py-2 bg-vibe-green text-white rounded-lg"
+          className="px-4 py-2 bg-green-500 text-white rounded-lg hover:bg-green-600 transition-colors"
         >
           Вернуться к плейлистам
         </button>
@@ -122,48 +153,47 @@ export default function PlaylistDetail() {
 
   if (!playlist) return null;
 
-  // Фильтруем треки, которые еще не добавлены в плейлист
   const tracksNotInPlaylist = availableTracks.filter(
-    track => !playlist.tracks.some(playlistTrack => playlistTrack.id === track.id)
+    availTrack => !playlist.tracks.some(playlistTrack => playlistTrack.id === availTrack.id)
   );
 
   return (
-    <div className="p-8">
-      <div className="flex justify-between items-center mb-6">
-        <h1 className="text-3xl font-bold">{playlist.name}</h1>
+    <div className="p-6 sm:p-8 text-white">
+      <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center mb-6">
+        <h1 className="text-3xl font-bold mb-2 sm:mb-0">{playlist.name}</h1>
         <button 
           onClick={() => navigate('/playlists')}
-          className="px-4 py-2 text-vibe-gray hover:text-white"
+          className="px-4 py-2 text-neutral-400 hover:text-white transition-colors"
         >
           Назад к плейлистам
         </button>
       </div>
       
       {playlist.description && (
-        <p className="text-vibe-gray mb-8">{playlist.description}</p>
+        <p className="text-neutral-400 mb-8 max-w-2xl">{playlist.description}</p>
       )}
 
       {error && (
-        <div className="bg-red-500 text-white p-3 rounded-lg mb-6">{error}</div>
+        <div className="bg-red-700 border border-red-900 text-white p-3 rounded-lg mb-6">{error}</div>
       )}
       
-      <div className="mb-10">
-        <h2 className="text-2xl font-semibold mb-4">Добавить трек</h2>
-        <form onSubmit={handleAddTrack} className="bg-[#282828] p-5 rounded-lg">
-          <div className="flex flex-col md:flex-row md:items-end gap-4">
+      <div className="mb-10 bg-neutral-800 p-6 rounded-lg shadow-md">
+        <h2 className="text-2xl font-semibold mb-4">Добавить трек в плейлист</h2>
+        <form onSubmit={handleAddTrack}>
+          <div className="flex flex-col sm:flex-row sm:items-end gap-4">
             <div className="flex-grow">
-              <label htmlFor="trackSelect" className="block text-sm text-vibe-gray mb-2">
+              <label htmlFor="trackSelect" className="block text-sm text-neutral-300 mb-1">
                 Выберите трек
               </label>
               <select
                 id="trackSelect"
                 value={selectedTrackId}
                 onChange={(e) => setSelectedTrackId(e.target.value)}
-                className="w-full h-[50px] bg-[#3E3E3E] text-white rounded-[5px] px-4 focus:outline-none focus:ring-2 focus:ring-vibe-green"
+                className="w-full h-12 bg-neutral-700 border border-neutral-600 text-white rounded-md px-4 focus:outline-none focus:ring-2 focus:ring-green-500 appearance-none"
               >
-                <option value="">-- Выберите трек --</option>
+                <option value="" disabled className="text-neutral-500">-- Выберите трек --</option>
                 {tracksNotInPlaylist.map(track => (
-                  <option key={track.id} value={track.id}>
+                  <option key={track.id} value={track.id} className="text-white bg-neutral-700">
                     {track.title} - {track.musician.username}
                   </option>
                 ))}
@@ -171,7 +201,8 @@ export default function PlaylistDetail() {
             </div>
             <button
               type="submit"
-              className="h-[50px] bg-vibe-green hover:bg-[#147D43] text-white font-medium rounded-[5px] px-6 transition-colors duration-200"
+              disabled={!selectedTrackId}
+              className="h-12 bg-green-500 hover:bg-green-600 disabled:bg-neutral-600 text-white font-medium rounded-md px-6 transition-colors duration-200 focus:outline-none focus:ring-2 focus:ring-green-400"
             >
               Добавить
             </button>
@@ -182,63 +213,43 @@ export default function PlaylistDetail() {
       <div>
         <h2 className="text-2xl font-semibold mb-4">Треки в плейлисте</h2>
         {playlist.tracks.length === 0 ? (
-          <div className="text-vibe-gray">В плейлисте пока нет треков</div>
+          <div className="text-neutral-400 py-4">В плейлисте пока нет треков.</div>
         ) : (
-          <div className="bg-[#282828] rounded-lg overflow-hidden">
-            <table className="min-w-full divide-y divide-gray-700">
-              <thead className="bg-[#1E1E1E]">
-                <tr>
-                  <th className="px-6 py-3 text-left text-xs font-medium text-vibe-gray uppercase tracking-wider">#</th>
-                  <th className="px-6 py-3 text-left text-xs font-medium text-vibe-gray uppercase tracking-wider">Название</th>
-                  <th className="px-6 py-3 text-left text-xs font-medium text-vibe-gray uppercase tracking-wider">Исполнитель</th>
-                  <th className="px-6 py-3 text-left text-xs font-medium text-vibe-gray uppercase tracking-wider">Жанр</th>
-                  <th className="px-6 py-3 text-center text-xs font-medium text-vibe-gray uppercase tracking-wider">Статистика</th>
-                  <th className="px-6 py-3 text-right text-xs font-medium text-vibe-gray uppercase tracking-wider">Действия</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-gray-700">
-                {playlist.tracks.map((track, index) => (
-                  <tr key={track.id} className="hover:bg-[#333333]">
-                    <td className="px-6 py-4 whitespace-nowrap text-sm font-medium">{index + 1}</td>
-                    <td className="px-6 py-4 whitespace-nowrap text-sm font-medium">{track.title}</td>
-                    <td className="px-6 py-4 whitespace-nowrap text-sm text-vibe-gray">{track.musician.username}</td>
-                    <td className="px-6 py-4 whitespace-nowrap text-sm text-vibe-gray">{track.genre}</td>
-                    <td className="px-6 py-4 whitespace-nowrap text-sm text-vibe-gray text-center">
-                      <div className="flex items-center justify-center space-x-4">
-                        <span className="flex items-center">
-                          <svg className="w-4 h-4 mr-1" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z" />
-                          </svg>
-                          {track.plays}
-                        </span>
-                        <span className="flex items-center">
-                          <svg className="w-4 h-4 mr-1" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4.318 6.318a4.5 4.5 0 000 6.364L12 20.364l7.682-7.682a4.5 4.5 0 00-6.364-6.364L12 7.636l-1.318-1.318a4.5 4.5 0 00-6.364 0z" />
-                          </svg>
-                          {track.likes}
-                        </span>
-                      </div>
-                    </td>
-                    <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-right">
-                      <div className="flex justify-end space-x-3">
-                        <button
-                          onClick={() => handlePlayTrack(track)}
-                          className="text-vibe-green hover:text-[#147D43] transition-colors duration-200"
-                        >
-                          Слушать
-                        </button>
-                        <button
-                          onClick={() => handleRemoveTrack(track.id)}
-                          className="text-red-500 hover:text-red-400 transition-colors duration-200"
-                        >
-                          Удалить
-                        </button>
-                      </div>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+          <div className="bg-neutral-800 rounded-lg shadow-md overflow-hidden">
+            <ul className="divide-y divide-neutral-700">
+              {playlist.tracks.map((track, index) => (
+                <li key={track.id} className="p-3 sm:p-4 hover:bg-neutral-750 transition-colors flex items-center space-x-3 sm:space-x-4">
+                  <button 
+                    onClick={() => handlePlayPauseTrack(track, index)}
+                    className="p-2 rounded-full hover:bg-neutral-600 focus:outline-none focus:ring-2 focus:ring-green-500"
+                    aria-label={currentTrack?.id === track.id && isPlaying ? "Pause" : "Play"}
+                  >
+                    {currentTrack?.id === track.id && isPlaying ? 
+                      <PauseIcon className="w-5 h-5 sm:w-6 sm:h-6 text-green-400" /> : 
+                      <PlayIcon className="w-5 h-5 sm:w-6 sm:h-6 text-neutral-300 hover:text-white" />
+                    }
+                  </button>
+                  {track.cover_image && (
+                      <img src={track.cover_image} alt={track.title} className="w-10 h-10 sm:w-12 sm:h-12 rounded object-cover hidden sm:block"/>
+                  )}
+                  <div className="flex-grow min-w-0">
+                    <p className="text-sm sm:text-base font-medium text-white truncate" title={track.title}>{track.title}</p>
+                    <p className="text-xs sm:text-sm text-neutral-400 truncate" title={track.musician.username}>{track.musician.username}</p>
+                  </div>
+                  <div className="text-xs sm:text-sm text-neutral-400 hidden md:block truncate px-2" title={track.genre}>{track.genre}</div>
+                  <div className="text-xs sm:text-sm text-neutral-400 hidden lg:block px-2">
+                    {track.plays} plays / {track.likes} likes
+                  </div>
+                  <button
+                    onClick={() => handleRemoveTrack(track.id)}
+                    className="p-2 rounded-full hover:bg-neutral-600 focus:outline-none focus:ring-2 focus:ring-red-500 ml-auto"
+                    aria-label="Remove track"
+                  >
+                    <TrashIcon className="w-5 h-5 text-neutral-400 hover:text-red-400" />
+                  </button>
+                </li>
+              ))}
+            </ul>
           </div>
         )}
       </div>
