@@ -284,15 +284,20 @@ class TrackViewSet(viewsets.ModelViewSet):
         seen_track_ids = set()
 
         # 1. Добавляем треки из плейлистов пользователя
-        user_playlists = Playlist.objects.filter(user=user).prefetch_related('tracks_through_playlisttrack__track')
-        playlist_tracks = []
+        user_playlists = Playlist.objects.filter(user=user).prefetch_related(
+            'tracks' # Предзагружаем непосредственно треки
+        )
+        playlist_tracks_from_playlists = []
         for pl in user_playlists:
-            # Сортируем треки в плейлисте по их порядку, если он есть
-            sorted_playlist_tracks = sorted(pl.tracks_through_playlisttrack.all(), key=lambda pt: pt.order)
-            for pt_entry in sorted_playlist_tracks:
-                playlist_tracks.append(pt_entry.track)
+            # Получаем треки, связанные с этим плейлистом, уже отсортированные по order из PlaylistTrack
+            # Это потребует дополнительной логики, если сортировка важна на этом этапе
+            # Для простоты пока берем .all(), но для сортировки нужен доступ к PlaylistTrack
+            # Вернемся к варианту с playlisttrack_set для сохранения сортировки
+            playlist_tracks_entries = pl.playlisttrack_set.select_related('track').order_by('order')
+            for pt_entry in playlist_tracks_entries:
+                playlist_tracks_from_playlists.append(pt_entry.track)
 
-        for track in playlist_tracks:
+        for track in playlist_tracks_from_playlists:
             if track.id not in seen_track_ids:
                 final_recommendations.append(track)
                 seen_track_ids.add(track.id)
@@ -353,17 +358,19 @@ class TrackViewSet(viewsets.ModelViewSet):
         current_track_id_str = request.query_params.get('current_track_id', None)
         current_track_id = int(current_track_id_str) if current_track_id_str and current_track_id_str.isdigit() else None
 
-        # 1. Добавляем треки из плейлистов пользователя (можно взять несколько, например, последние добавленные или случайные)
-        # Для простоты, пока возьмем до 2 треков из плейлистов, если они есть
-        user_playlists = Playlist.objects.filter(user=user).prefetch_related('tracks_through_playlisttrack__track')
+        # 1. Добавляем треки из плейлистов пользователя
+        user_playlists = Playlist.objects.filter(user=user).prefetch_related(
+            'playlisttrack_set__track' # Остаемся с этим вариантом для сортировки
+        )
         playlist_tracks_for_live = []
-        temp_playlist_tracks = []
+        temp_playlist_tracks_collected = []
         for pl in user_playlists:
-            sorted_playlist_tracks = sorted(pl.tracks_through_playlisttrack.all(), key=lambda pt: pt.order, reverse=True) # Последние добавленные/измененные могут быть интереснее
-            for pt_entry in sorted_playlist_tracks:
-                temp_playlist_tracks.append(pt_entry.track)
-
-        for track in temp_playlist_tracks:
+            # Сортируем треки в плейлисте по их порядку (через PlaylistTrack)
+            sorted_playlist_tracks_entries = pl.playlisttrack_set.select_related('track').order_by('-order') # последние добавленные/измененные
+            for pt_entry in sorted_playlist_tracks_entries:
+                temp_playlist_tracks_collected.append(pt_entry.track)
+        
+        for track in temp_playlist_tracks_collected:
             if track.id not in seen_track_ids:
                 playlist_tracks_for_live.append(track)
                 seen_track_ids.add(track.id)

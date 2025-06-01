@@ -165,4 +165,4 @@ CORS_ALLOW_ALL_ORIGINS = True  # Only for development
 CORS_ALLOW_CREDENTIALS = True
 
 # Gemini API Key
-GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
+GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY', 'AIzaSyC6v5YHvOz2r_6K1aYK6Ihg1k3UvojTRFo') # Обновленный ключ как fallback, если переменная окружения не установлена
