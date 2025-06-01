@@ -18,8 +18,11 @@ from datetime import datetime
 from collections import Counter
 from django.db.models import F
 from django.db import transaction
+from .services import generate_recommendations_with_gemini, get_recommendations_for_visual_update
+import logging
 
 CustomUser = get_user_model()
+logger = logging.getLogger(__name__)
 
 # Create your views here.
 
@@ -276,202 +279,134 @@ class TrackViewSet(viewsets.ModelViewSet):
     @action(detail=False, methods=['get'])
     def recommendations(self, request):
         user = request.user
+        target_recommendation_count = 20
         final_recommendations = []
-        recommended_track_ids = set() # To avoid duplicates
+        seen_track_ids = set()
 
-        # --- 0. Get tracks user has already interacted with significantly (listened/added to playlist) ---
-        user_listened_ids = get_user_listened_track_ids(user)
+        # 1. Добавляем треки из плейлистов пользователя
+        user_playlists = Playlist.objects.filter(user=user).prefetch_related('tracks_through_playlisttrack__track')
+        playlist_tracks = []
+        for pl in user_playlists:
+            # Сортируем треки в плейлисте по их порядку, если он есть
+            sorted_playlist_tracks = sorted(pl.tracks_through_playlisttrack.all(), key=lambda pt: pt.order)
+            for pt_entry in sorted_playlist_tracks:
+                playlist_tracks.append(pt_entry.track)
 
-        # --- 1. Globally Popular Tracks (fallback / general) ---
-        # Exclude tracks user already listened to
-        global_top_tracks = Track.objects.filter(is_active=True) \
-                                .exclude(id__in=user_listened_ids) \
-                                .order_by('-plays', '-likes')[:10] # A bit more for initial pool
-        for track in global_top_tracks[:5]: # Take top 5 for this category
-            if track.id not in recommended_track_ids:
+        for track in playlist_tracks:
+            if track.id not in seen_track_ids:
                 final_recommendations.append(track)
-                recommended_track_ids.add(track.id)
+                seen_track_ids.add(track.id)
+                if len(final_recommendations) >= target_recommendation_count:
+                    break
+            if len(final_recommendations) >= target_recommendation_count:
+                break
 
+        logger.info(f"User {user.id} ({user.username}): Added {len(final_recommendations)} tracks from their playlists to recommendations.")
 
-        # --- 2. Artist-based recommendations ---
-        top_user_artists = get_top_artists_by_user(user, limit=3, listened_track_ids=user_listened_ids)
-        if top_user_artists:
-            artist_tracks_queryset = Track.objects.filter(
-                is_active=True,
-                musician__in=top_user_artists
-            ).exclude(id__in=recommended_track_ids).exclude(id__in=user_listened_ids) \
-             .order_by('-plays', '-likes') # Could also order by other metrics like newness
+        # 2. Добавляем рекомендации от Gemini или из fallback, если место еще есть
+        if len(final_recommendations) < target_recommendation_count:
+            # Запрашиваем у Gemini/fallback чуть больше, чтобы было из чего выбрать после удаления дубликатов
+            num_needed_from_ai = target_recommendation_count - len(final_recommendations)
+            # Мы запросим полный count у Gemini, а потом отфильтруем
 
-            # To make it more diverse, get a few tracks from each top artist
-            artist_recs_limit_per_artist = 2
-            for artist in top_user_artists:
-                artist_specific_tracks = artist_tracks_queryset.filter(musician=artist)[:artist_recs_limit_per_artist]
-                for track in artist_specific_tracks:
-                    if track.id not in recommended_track_ids and len(final_recommendations) < 20: # Overall limit
-                        final_recommendations.append(track)
-                        recommended_track_ids.add(track.id)
+            ai_or_fallback_recs = []
+            gemini_recs = generate_recommendations_with_gemini(user, count=target_recommendation_count) # Просим стандартное количество
 
-        # --- 3. Genre-based recommendations (based on listened genres) ---
-        user_listened_genres = UserTrackInteraction.objects.filter(
-            user=user,
-            interaction_type__in=[
-                UserTrackInteraction.InteractionTypes.PLAY_FULLY_COMPLETED,
-                UserTrackInteraction.InteractionTypes.ADD_TO_PLAYLIST
-            ]
-        ).select_related('track').values_list('track__genre', flat=True).distinct()
+            if gemini_recs:
+                logger.info(f"User {user.id}: Got {len(gemini_recs)} recommendations from Gemini.")
+                ai_or_fallback_recs = gemini_recs
+            else:
+                logger.info(f"Gemini returned no recommendations for user {user.id} ({user.username}). Falling back to globally popular tracks.")
+                user_listened_ids = get_user_listened_track_ids(user) # Включает треки из плейлистов
 
-        if user_listened_genres:
-            genre_tracks = Track.objects.filter(
-                is_active=True,
-                genre__in=list(user_listened_genres)
-            ).exclude(id__in=recommended_track_ids).exclude(id__in=user_listened_ids) \
-             .order_by('-plays', '-likes')[:5] # Get top 5 for this category
+                fallback_tracks = Track.objects.filter(is_active=True) \
+                                        .exclude(id__in=seen_track_ids) \
+                                        .exclude(id__in=user_listened_ids) \
+                                        .order_by('-plays', '-likes')[:target_recommendation_count] # Просим побольше для запаса
+                ai_or_fallback_recs = list(fallback_tracks)
 
-            for track in genre_tracks:
-                if track.id not in recommended_track_ids and len(final_recommendations) < 25: # Overall limit
+                if not ai_or_fallback_recs:
+                    logger.info(f"Fallback (globally popular) also returned no new tracks for user {user.id}. Getting very new tracks.")
+                    fallback_tracks_newest = Track.objects.filter(is_active=True) \
+                                        .exclude(id__in=seen_track_ids) \
+                                        .exclude(id__in=user_listened_ids) \
+                                        .order_by('-created_at')[:target_recommendation_count]
+                    ai_or_fallback_recs = list(fallback_tracks_newest)
+
+            for track in ai_or_fallback_recs:
+                if track.id not in seen_track_ids:
                     final_recommendations.append(track)
-                    recommended_track_ids.add(track.id)
+                    seen_track_ids.add(track.id)
+                if len(final_recommendations) >= target_recommendation_count:
+                    break
 
-        # --- 4. Collaborative Filtering (Simple: tracks from similar users) ---
-        # This can be computationally expensive, use with caution or optimize (e.g., run periodically)
-        # For now, let's make it simpler or skip if too slow
-        similar_users = get_users_with_similar_interaction_history(user, threshold=0.2, min_common_tracks=2)
-        if similar_users:
-            collab_track_ids = UserTrackInteraction.objects.filter(
-                user__in=similar_users,
-                interaction_type__in=[
-                    UserTrackInteraction.InteractionTypes.PLAY_FULLY_COMPLETED,
-                    UserTrackInteraction.InteractionTypes.ADD_TO_PLAYLIST
-                ]
-            ).exclude(track_id__in=recommended_track_ids).exclude(track_id__in=user_listened_ids) \
-             .values_list('track_id', flat=True).distinct()
-
-            collab_tracks = Track.objects.filter(id__in=list(collab_track_ids)[:10]) # Limit to 10 potential tracks
-            for track in collab_tracks[:5]: # Take top 5 for this category
-                 if track.id not in recommended_track_ids and len(final_recommendations) < 30: # Overall limit
-                    final_recommendations.append(track)
-                    recommended_track_ids.add(track.id)
-
-
-        # --- 5. Content-based (tracks similar to liked/frequently played by user) ---
-        # This requires more detailed track features (mood, BPM) and user history analysis.
-        user_positive_interactions = UserTrackInteraction.objects.filter(
-            user=user,
-            interaction_type__in=[
-                UserTrackInteraction.InteractionTypes.LIKE,
-                UserTrackInteraction.InteractionTypes.PLAY_FULLY_COMPLETED,
-                UserTrackInteraction.InteractionTypes.ADD_TO_PLAYLIST
-            ]
-        ).select_related('track')
-
-        # Get features from these positively interacted tracks
-        liked_genres = set()
-        liked_moods = set()
-        # approx_bpm_sum = 0
-        # bpm_count = 0
-
-        for interaction in user_positive_interactions:
-            if interaction.track.genre:
-                liked_genres.add(interaction.track.genre)
-            if interaction.track.mood:
-                liked_moods.add(interaction.track.mood)
-            # if interaction.track.bpm:
-            #     approx_bpm_sum += interaction.track.bpm
-            #     bpm_count +=1
-        # avg_bpm = approx_bpm_sum / bpm_count if bpm_count > 0 else None
-
-        if liked_genres or liked_moods: # or avg_bpm
-            content_query = Q(is_active=True)
-            if liked_genres:
-                content_query &= Q(genre__in=list(liked_genres))
-            if liked_moods:
-                content_query &= Q(mood__in=list(liked_moods))
-            # if avg_bpm:
-            #     bpm_range_width = 15 # Tracks with BPM +/- 15 of average
-            #     content_query &= Q(bpm__range=(avg_bpm - bpm_range_width, avg_bpm + bpm_range_width))
-
-            content_based_tracks = Track.objects.filter(content_query) \
-                                       .exclude(id__in=recommended_track_ids) \
-                                       .exclude(id__in=user_listened_ids) \
-                                       .order_by('?')[:10] # Randomize to get variety, then pick top
-
-            for track in content_based_tracks[:5]: # Take top 5 for this category
-                if track.id not in recommended_track_ids and len(final_recommendations) < 35: # Overall limit
-                    final_recommendations.append(track)
-                    recommended_track_ids.add(track.id)
-
-
-        # --- 6. Time of Day Recommendations (Contextual) ---
-        now = timezone.now() # timezone.now() returns an aware datetime object, usually in UTC
-        current_time_slot = 'any'
-        if now.hour < 12: # Assuming UTC for now, adjust if server/user timezone differs
-            current_time_slot = 'morning'
-        elif now.hour < 18:
-            current_time_slot = 'day'
-        else:
-            current_time_slot = 'evening'
-
-        if current_time_slot != 'any':
-            time_based_tracks = Track.objects.filter(
-                is_active=True,
-                suitable_for_time__in=[current_time_slot, 'any'] # Tracks for current slot or 'any'
-            ).exclude(id__in=recommended_track_ids).exclude(id__in=user_listened_ids) \
-             .order_by('?')[:5] # Randomize to get variety, then pick top
-
-            for track in time_based_tracks[:3]: # Take top 3 for this category
-                 if track.id not in recommended_track_ids and len(final_recommendations) < 40: # Overall limit
-                    final_recommendations.append(track)
-                    recommended_track_ids.add(track.id)
-
-        # --- 7. Recommendations by Tag (if user has interacted with tagged tracks) ---
-        # This can be further enhanced by looking at tags of tracks user liked/played
-        # For now, let's get some popular tracks from tags user has interacted with
-        user_interacted_tags = Tag.objects.filter(
-            tracks__user_interactions__user=user,
-            tracks__user_interactions__interaction_type__in=[
-                UserTrackInteraction.InteractionTypes.LIKE,
-                UserTrackInteraction.InteractionTypes.PLAY_FULLY_COMPLETED,
-                UserTrackInteraction.InteractionTypes.ADD_TO_PLAYLIST
-            ]
-        ).distinct()
-
-        if user_interacted_tags:
-            tag_based_tracks = Track.objects.filter(
-                is_active=True,
-                tags__in=user_interacted_tags
-            ).exclude(id__in=recommended_track_ids).exclude(id__in=user_listened_ids) \
-            .distinct().order_by('?')[:5] # Randomize and take a few
-
-            for track in tag_based_tracks:
-                 if track.id not in recommended_track_ids and len(final_recommendations) < 40: # Overall limit
-                    final_recommendations.append(track)
-                    recommended_track_ids.add(track.id)
-
-
-        # --- Scoring and Final Selection (Optional for now, can be complex) ---
-        # For now, we are just concatenating. A more advanced approach would be:
-        # 1. Gather a larger pool of candidates from all strategies.
-        # 2. Score each candidate track using get_track_score(user, track, all_user_interactions).
-        # 3. Sort by score and take top N.
-        # This requires fetching all_user_interactions once.
-        # all_user_interactions = UserTrackInteraction.objects.filter(user=user)
-        # final_recommendations.sort(key=lambda t: get_track_score(user, t, all_user_interactions), reverse=True)
-
-        # Remove duplicates again (if any introduced by different queries fetching same track)
-        # and ensure final list has unique tracks
-        unique_final_recs = []
-        seen_ids = set()
-        for track in final_recommendations:
-            if track.id not in seen_ids:
-                unique_final_recs.append(track)
-                seen_ids.add(track.id)
-
-        # Limit the total number of recommendations
-        final_recommendations_limited = unique_final_recs[:20] # Max 20 recommendations
-
-        serializer = self.get_serializer(final_recommendations_limited, many=True)
+        serializer = self.get_serializer(final_recommendations[:target_recommendation_count], many=True, context={'request': request})
         return Response(serializer.data)
 
+    @action(detail=False, methods=['get'], url_path='live-recommendations')
+    def live_recommendations(self, request):
+        user = request.user
+        target_recommendation_count = 5 # Меньше для live
+        final_recommendations = []
+        seen_track_ids = set()
+
+        current_track_id_str = request.query_params.get('current_track_id', None)
+        current_track_id = int(current_track_id_str) if current_track_id_str and current_track_id_str.isdigit() else None
+
+        # 1. Добавляем треки из плейлистов пользователя (можно взять несколько, например, последние добавленные или случайные)
+        # Для простоты, пока возьмем до 2 треков из плейлистов, если они есть
+        user_playlists = Playlist.objects.filter(user=user).prefetch_related('tracks_through_playlisttrack__track')
+        playlist_tracks_for_live = []
+        temp_playlist_tracks = []
+        for pl in user_playlists:
+            sorted_playlist_tracks = sorted(pl.tracks_through_playlisttrack.all(), key=lambda pt: pt.order, reverse=True) # Последние добавленные/измененные могут быть интереснее
+            for pt_entry in sorted_playlist_tracks:
+                temp_playlist_tracks.append(pt_entry.track)
+
+        for track in temp_playlist_tracks:
+            if track.id not in seen_track_ids:
+                playlist_tracks_for_live.append(track)
+                seen_track_ids.add(track.id)
+            if len(playlist_tracks_for_live) >= 2: # Ограничим 2 треками из плейлистов для live-рекомендаций
+                break
+
+        final_recommendations.extend(playlist_tracks_for_live)
+        logger.info(f"User {user.id} ({user.username}): Added {len(playlist_tracks_for_live)} tracks from their playlists to live recommendations.")
+
+        # 2. Добавляем рекомендации от Gemini (с учетом текущего трека), если место еще есть
+        if len(final_recommendations) < target_recommendation_count:
+            num_needed_from_ai = target_recommendation_count - len(final_recommendations)
+
+            ai_recs = get_recommendations_for_visual_update(
+                user,
+                current_track_id=current_track_id,
+                count=target_recommendation_count # Просим у Gemini общее желаемое количество, фильтруем потом
+            )
+
+            for track in ai_recs:
+                if track.id not in seen_track_ids:
+                    final_recommendations.append(track)
+                    seen_track_ids.add(track.id)
+                if len(final_recommendations) >= target_recommendation_count:
+                    break
+
+        # Если после Gemini все еще мало, можно добавить из общего fallback, но для live это менее критично
+        if len(final_recommendations) < target_recommendation_count:
+            logger.info(f"User {user.id}: Not enough live recommendations from Gemini + playlists. Adding popular as fallback.")
+            user_listened_ids = get_user_listened_track_ids(user)
+            fallback_tracks = Track.objects.filter(is_active=True) \
+                                    .exclude(id__in=seen_track_ids) \
+                                    .exclude(id__in=user_listened_ids) \
+                                    .order_by('-plays', '-likes')[:target_recommendation_count - len(final_recommendations)]
+            for track in fallback_tracks:
+                 if track.id not in seen_track_ids:
+                    final_recommendations.append(track)
+                    seen_track_ids.add(track.id)
+                 if len(final_recommendations) >= target_recommendation_count:
+                    break
+
+        serializer = self.get_serializer(final_recommendations[:target_recommendation_count], many=True, context={'request': request})
+        return Response(serializer.data)
 
     @action(detail=False, methods=['get'])
     def charts(self, request):
